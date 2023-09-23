@@ -34,19 +34,49 @@
 }
 @end
 
+@interface FLTQueuePlayer : AVQueuePlayer
+@end
+
+@implementation FLTQueuePlayer
+//- (instancetype)playerWithPlayerItem:(nullable AVPlayerItem *)item {
+//  FLTQueuePlayer *player = [FLTQueuePlayer playerWithPlayerItem:item];
+//  _observerCallback = callback;
+//  return player;
+//}
+
+- (void)insertItem:(AVPlayerItem *)item
+         afterItem:(nullable AVPlayerItem *)afterItem {
+    if (item.outputs.count == 0) {
+        NSLog(@"Creating AVPlayerItemVideoOutput");
+        NSDictionary* pixBuffAttributes = @{
+          (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+          (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
+        };
+        AVPlayerItemVideoOutput* videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixBuffAttributes];
+        [item addOutput:videoOutput];
+    }
+    [super insertItem:item afterItem:afterItem];
+}
+
+@end
+
 @interface FVPDefaultPlayerFactory : NSObject <FVPPlayerFactory>
 @end
 
 @implementation FVPDefaultPlayerFactory
-- (AVPlayer *)playerWithPlayerItem:(AVPlayerItem *)playerItem {
-  return [AVPlayer playerWithPlayerItem:playerItem];
+
+- (AVQueuePlayer *)playerWithPlayerItem:(AVPlayerItem *)playerItem {
+  return [FLTQueuePlayer playerWithPlayerItem:playerItem];
 }
 
 @end
 
 @interface FLTVideoPlayer : NSObject <FlutterTexture, FlutterStreamHandler>
-@property(readonly, nonatomic) AVPlayer *player;
-@property(readonly, nonatomic) AVPlayerItemVideoOutput *videoOutput;
+@property(readonly, nonatomic) AVQueuePlayer* player;
+@property(readonly, nonatomic) AVPlayerLooper* playerLooper API_AVAILABLE(ios(10.0));
+// template item that will be passed to playerLooper
+// not used for iOS < 10.0
+@property(readonly, nonatomic) AVPlayerItem* templateItem;
 // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
 // (https://github.com/flutter/flutter/issues/111457) and 2. swapped width and height for some video
 // streams (not just iOS 16).  (https://github.com/flutter/flutter/issues/109116).
@@ -121,10 +151,25 @@ static void *rateContext = &rateContext;
                                              object:item];
 }
 
+- (void)removeObservers {
+  [[_player currentItem] removeObserver:self forKeyPath:@"status"];
+  [[_player currentItem] removeObserver:self forKeyPath:@"loadedTimeRanges"];
+  [[_player currentItem] removeObserver:self forKeyPath:@"presentationSize"];
+  [[_player currentItem] removeObserver:self forKeyPath:@"duration"];
+  [[_player currentItem] removeObserver:self forKeyPath:@"playbackLikelyToKeepUp"];
+  [self.player removeObserver:self forKeyPath:@"rate"];
+
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
 - (void)itemDidPlayToEndTime:(NSNotification *)notification {
   if (_isLooping) {
-    AVPlayerItem *p = [notification object];
-    [p seekToTime:kCMTimeZero completionHandler:nil];
+      if (@available(iOS 10.0, *)) {
+
+      } else {
+        AVPlayerItem* p = [notification object];
+        [p seekToTime:kCMTimeZero completionHandler:nil];
+      }
   } else {
     if (_eventSink) {
       _eventSink(@{@"event" : @"completed"});
@@ -195,19 +240,6 @@ NS_INLINE UIViewController *rootViewController(void) {
   return videoComposition;
 }
 
-- (void)createVideoOutputAndDisplayLink:(FLTFrameUpdater *)frameUpdater {
-  NSDictionary *pixBuffAttributes = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
-  };
-  _videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixBuffAttributes];
-
-  _displayLink = [CADisplayLink displayLinkWithTarget:frameUpdater
-                                             selector:@selector(onDisplayLink:)];
-  [_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
-  _displayLink.paused = YES;
-}
-
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FLTFrameUpdater *)frameUpdater
                 httpHeaders:(nonnull NSDictionary<NSString *, NSString *> *)headers
@@ -256,6 +288,7 @@ NS_INLINE UIViewController *rootViewController(void) {
     }
   };
 
+  _templateItem = item;
   _player = [playerFactory playerWithPlayerItem:item];
   _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
@@ -267,7 +300,9 @@ NS_INLINE UIViewController *rootViewController(void) {
   _playerLayer = [AVPlayerLayer playerLayerWithPlayer:_player];
   [rootViewController().view.layer addSublayer:_playerLayer];
 
-  [self createVideoOutputAndDisplayLink:frameUpdater];
+  _displayLink = [CADisplayLink displayLinkWithTarget:frameUpdater selector:@selector(onDisplayLink:)];
+  [_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+  _displayLink.paused = YES;
 
   [self addObserversForItem:item player:_player];
 
@@ -305,7 +340,6 @@ NS_INLINE UIViewController *rootViewController(void) {
       case AVPlayerItemStatusUnknown:
         break;
       case AVPlayerItemStatusReadyToPlay:
-        [item addOutput:_videoOutput];
         [self setupEventSinkIfReadyToPlay];
         [self updatePlayingState];
         break;
@@ -414,6 +448,7 @@ NS_INLINE UIViewController *rootViewController(void) {
 }
 
 - (int64_t)position {
+  NSLog(@"loop AVPlayerItemVideoOutput %ld", (long)_playerLooper.loopCount);
   return FLTCMTimeToMillis([_player currentTime]);
 }
 
@@ -439,6 +474,17 @@ NS_INLINE UIViewController *rootViewController(void) {
 
 - (void)setIsLooping:(BOOL)isLooping {
   _isLooping = isLooping;
+  if (@available(iOS 10.0, *)) {
+    if (!_isInitialized) {
+      return;
+    }
+    if (_isLooping) {
+      _playerLooper = [AVPlayerLooper playerLooperWithPlayer:_player templateItem:_templateItem];
+    } else {
+      [_playerLooper disableLooping];
+      _playerLooper = nil;
+    }
+  }
 }
 
 - (void)setVolume:(double)volume {
@@ -470,9 +516,10 @@ NS_INLINE UIViewController *rootViewController(void) {
 }
 
 - (CVPixelBufferRef)copyPixelBuffer {
-  CMTime outputItemTime = [_videoOutput itemTimeForHostTime:CACurrentMediaTime()];
-  if ([_videoOutput hasNewPixelBufferForItemTime:outputItemTime]) {
-    return [_videoOutput copyPixelBufferForItemTime:outputItemTime itemTimeForDisplay:NULL];
+  AVPlayerItemVideoOutput *videoOutput = (AVPlayerItemVideoOutput*) _player.currentItem.outputs.firstObject;
+  CMTime outputItemTime = [videoOutput itemTimeForHostTime:CACurrentMediaTime()];
+  if ([videoOutput hasNewPixelBufferForItemTime:outputItemTime]) {
+    return [videoOutput copyPixelBufferForItemTime:outputItemTime itemTimeForDisplay:NULL];
   } else {
     return NULL;
   }
@@ -516,16 +563,8 @@ NS_INLINE UIViewController *rootViewController(void) {
   _disposed = YES;
   [_playerLayer removeFromSuperlayer];
   [_displayLink invalidate];
-  AVPlayerItem *currentItem = self.player.currentItem;
-  [currentItem removeObserver:self forKeyPath:@"status"];
-  [currentItem removeObserver:self forKeyPath:@"loadedTimeRanges"];
-  [currentItem removeObserver:self forKeyPath:@"presentationSize"];
-  [currentItem removeObserver:self forKeyPath:@"duration"];
-  [currentItem removeObserver:self forKeyPath:@"playbackLikelyToKeepUp"];
-  [self.player removeObserver:self forKeyPath:@"rate"];
-
-  [self.player replaceCurrentItemWithPlayerItem:nil];
-  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [self removeObservers];
+  [self.player removeAllItems];
 }
 
 - (void)dispose {

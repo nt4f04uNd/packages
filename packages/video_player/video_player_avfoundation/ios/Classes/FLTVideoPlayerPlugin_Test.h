@@ -6,9 +6,11 @@
 
 #import <AVFoundation/AVFoundation.h>
 
+//typedef void(^ObserverCallback)(AVPlayerItem* item);
+
 // Protocol for an AVPlayer instance factory. Used for injecting players in tests.
 @protocol FVPPlayerFactory
-- (AVPlayer *)playerWithPlayerItem:(AVPlayerItem *)playerItem;
+- (AVQueuePlayer *)playerWithPlayerItem:(AVPlayerItem *)playerItem;
 @end
 
 @interface FLTVideoPlayerPlugin ()
